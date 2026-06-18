@@ -1,0 +1,6 @@
+{
+  "name": "Lenovo Support Dashboard",
+  "description": "A high-performance, minimalist, and professional support management dashboard for Lenovo Support. Features real-time ticket triage, interactive reviews, department analytics, product AMC status, and SLA performance snapshots.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
