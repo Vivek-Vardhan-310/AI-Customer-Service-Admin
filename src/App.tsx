@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { CheckCircle2, AlertTriangle, Info, X } from 'lucide-react';
 import Header from './components/Header';
@@ -13,6 +13,24 @@ import WarrantyContract from './components/WarrantyContract';
 import AiMonitoring from './components/AiMonitoring';
 import AdminLogin from './components/AdminLogin';
 
+// Supabase services
+import { supabase } from './supabaseClient';
+import {
+  getAdminSession,
+  adminLogout,
+  fetchAllTickets,
+  fetchAllCustomers,
+  fetchAllProducts,
+  fetchAllFeedback,
+  fetchSlaRules,
+  createSlaRule as createSlaRuleDB,
+  updateSlaRule as updateSlaRuleDB,
+  toggleSlaRuleStatus,
+  deleteSlaRule as deleteSlaRuleDB,
+  updateTicketStatus as updateTicketStatusDB,
+} from './supabaseService';
+
+// Fallback mock data (used when Supabase is not configured)
 import {
   INITIAL_TICKETS,
   INITIAL_CUSTOMERS,
@@ -29,6 +47,7 @@ export default function App() {
   const [adminEmail, setAdminEmail] = useState<string>(() => {
     return localStorage.getItem('lenovo_admin_email') || '';
   });
+  const [sessionChecked, setSessionChecked] = useState(false);
   const isAuthenticated = !!adminEmail;
 
   // Global Interactive In-App Status Notification
@@ -48,26 +67,111 @@ export default function App() {
     }
   }, [toast]);
 
+  // Data loading state
+  const [dataLoading, setDataLoading] = useState(false);
+
+  // Core Reactive States — start empty, load from Supabase or fallback to mock
+  const [tickets, setTickets] = useState<Ticket[]>([]);
+  const [customers, setCustomers] = useState<any[]>([]);
+  const [products, setProducts] = useState<any[]>([]);
+  const [reviews, setReviews] = useState<any[]>([]);
+  const [slaRules, setSlaRules] = useState<SlaRule[]>([]);
+
+  // Whether we're using live Supabase data or mock data
+  const isLiveMode = !!supabase;
+
+  // Ticket Integration State (Filter transfer from other tabs)
+  const [ticketsSearchTerm, setTicketsSearchTerm] = useState('');
+
+  // ── Check Supabase session on mount ──
+  useEffect(() => {
+    if (!supabase) {
+      setSessionChecked(true);
+      return;
+    }
+
+    (async () => {
+      try {
+        const session = await getAdminSession();
+        if (session) {
+          setAdminEmail(session.email);
+          localStorage.setItem('lenovo_admin_email', session.email);
+        }
+      } catch (e) {
+        console.error('Session check error:', e);
+      } finally {
+        setSessionChecked(true);
+      }
+    })();
+  }, []);
+
+  // ── Load all data when authenticated ──
+  const loadAllData = useCallback(async () => {
+    if (!isLiveMode) {
+      // Fallback to mock data when Supabase is not configured
+      setTickets(INITIAL_TICKETS);
+      setCustomers(INITIAL_CUSTOMERS);
+      setProducts(INITIAL_PRODUCTS);
+      setReviews(INITIAL_REVIEWS);
+      setSlaRules(INITIAL_SLA_RULES);
+      return;
+    }
+
+    setDataLoading(true);
+    try {
+      const [ticketsData, customersData, productsData, feedbackData, slaData] = await Promise.all([
+        fetchAllTickets(),
+        fetchAllCustomers(),
+        fetchAllProducts(),
+        fetchAllFeedback(),
+        fetchSlaRules(),
+      ]);
+
+      setTickets(ticketsData);
+      setCustomers(customersData);
+      setProducts(productsData);
+      setReviews(feedbackData);
+      setSlaRules(slaData);
+    } catch (e) {
+      console.error('Error loading admin data:', e);
+      showToast('Failed to load data from server', 'error');
+      // Fallback to mock data on error
+      setTickets(INITIAL_TICKETS);
+      setCustomers(INITIAL_CUSTOMERS);
+      setProducts(INITIAL_PRODUCTS);
+      setReviews(INITIAL_REVIEWS);
+      setSlaRules(INITIAL_SLA_RULES);
+    } finally {
+      setDataLoading(false);
+    }
+  }, [isLiveMode]);
+
+  useEffect(() => {
+    if (isAuthenticated) {
+      loadAllData();
+    }
+  }, [isAuthenticated, loadAllData]);
+
   const handleLoginSuccess = (email: string) => {
     setAdminEmail(email);
     localStorage.setItem('lenovo_admin_email', email);
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    try {
+      if (isLiveMode) await adminLogout();
+    } catch (e) {
+      console.error('Logout error:', e);
+    }
     setAdminEmail('');
     localStorage.removeItem('lenovo_admin_email');
     setActiveTab('DASHBOARD');
+    setTickets([]);
+    setCustomers([]);
+    setProducts([]);
+    setReviews([]);
+    setSlaRules([]);
   };
-
-  // Core Reactive States
-  const [tickets, setTickets] = useState<Ticket[]>(INITIAL_TICKETS);
-  const [customers, setCustomers] = useState(INITIAL_CUSTOMERS);
-  const [products] = useState(INITIAL_PRODUCTS);
-  const [reviews] = useState(INITIAL_REVIEWS);
-  const [slaRules, setSlaRules] = useState<SlaRule[]>(INITIAL_SLA_RULES);
-
-  // Ticket Integration State (Filter transfer from other tabs)
-  const [ticketsSearchTerm, setTicketsSearchTerm] = useState('');
 
   // 1. ADD TICKET
   const handleAddTicket = (newTicket: Ticket) => {
@@ -84,10 +188,21 @@ export default function App() {
   };
 
   // 2. UPDATE TICKET STATUS
-  const handleUpdateTicketStatus = (id: string, nextStatus: TicketStatus) => {
+  const handleUpdateTicketStatus = async (id: string, nextStatus: TicketStatus) => {
+    // Optimistic update
     setTickets((prev) =>
-      prev.map((t) => (t.id === id ? { ...t, status: nextStatus, lastUpdated: '1s ago' } : t))
+      prev.map((t) => (t.id === id ? { ...t, status: nextStatus, lastUpdated: 'Just now' } : t))
     );
+
+    if (isLiveMode) {
+      const success = await updateTicketStatusDB(id, nextStatus);
+      if (!success) {
+        showToast('Failed to update ticket status', 'error');
+        // Refresh to get correct state
+        const freshTickets = await fetchAllTickets();
+        setTickets(freshTickets);
+      }
+    }
   };
 
   // 3. ESCALATE TICKET (FROM REVIEWS COMPLAINT)
@@ -102,17 +217,36 @@ export default function App() {
   };
 
   // 4. ADD SLA RULE
-  const handleAddSlaRule = (newRule: SlaRule) => {
+  const handleAddSlaRule = async (newRule: SlaRule) => {
     setSlaRules((prev) => [...prev, newRule]);
+
+    if (isLiveMode) {
+      const success = await createSlaRuleDB(newRule);
+      if (!success) {
+        showToast('Failed to create SLA rule', 'error');
+        const freshRules = await fetchSlaRules();
+        setSlaRules(freshRules);
+      }
+    }
   };
 
   // 5. UPDATE SLA RULE
-  const handleUpdateSlaRule = (id: string, updatedRule: SlaRule) => {
+  const handleUpdateSlaRule = async (id: string, updatedRule: SlaRule) => {
     setSlaRules((prev) => prev.map((r) => (r.id === id ? updatedRule : r)));
+
+    if (isLiveMode) {
+      const success = await updateSlaRuleDB(id, updatedRule);
+      if (!success) {
+        showToast('Failed to update SLA rule', 'error');
+        const freshRules = await fetchSlaRules();
+        setSlaRules(freshRules);
+      }
+    }
   };
 
   // 6. TOGGLE SLA STATUS (ENABLE/DISABLE)
-  const handleToggleSlaRule = (id: string) => {
+  const handleToggleSlaRule = async (id: string) => {
+    const current = slaRules.find((r) => r.id === id);
     setSlaRules((prev) =>
       prev.map((r) =>
         r.id === id
@@ -120,11 +254,29 @@ export default function App() {
           : r
       )
     );
+
+    if (isLiveMode && current) {
+      const success = await toggleSlaRuleStatus(id, current.status);
+      if (!success) {
+        showToast('Failed to toggle SLA rule', 'error');
+        const freshRules = await fetchSlaRules();
+        setSlaRules(freshRules);
+      }
+    }
   };
 
   // 7. DELETE SLA RULE
-  const handleDeleteSlaRule = (id: string) => {
+  const handleDeleteSlaRule = async (id: string) => {
     setSlaRules((prev) => prev.filter((r) => r.id !== id));
+
+    if (isLiveMode) {
+      const success = await deleteSlaRuleDB(id);
+      if (!success) {
+        showToast('Failed to delete SLA rule', 'error');
+        const freshRules = await fetchSlaRules();
+        setSlaRules(freshRules);
+      }
+    }
   };
 
   // Intermediary link to trigger outbound email
@@ -234,19 +386,38 @@ export default function App() {
 
       {/* Main Dynamic View Content */}
       <main className="flex-grow max-w-7xl w-full mx-auto px-4 py-8">
-        <AnimatePresence mode="wait">
-          <motion.div
-            key={activeTab}
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -8 }}
-            transition={{ duration: 0.2, ease: 'easeOut' }}
-            id="tab-content"
-          >
-            {renderTabContent()}
-          </motion.div>
-        </AnimatePresence>
+        {dataLoading ? (
+          <div className="py-20 text-center">
+            <div className="inline-flex items-center space-x-2 text-neutral-500">
+              <span className="w-4 h-4 border-2 border-neutral-300 border-t-black rounded-full animate-spin" />
+              <span className="font-mono text-xs uppercase tracking-widest">Loading live data from Supabase...</span>
+            </div>
+          </div>
+        ) : (
+          <AnimatePresence mode="wait">
+            <motion.div
+              key={activeTab}
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              transition={{ duration: 0.2, ease: 'easeOut' }}
+              id="tab-content"
+            >
+              {renderTabContent()}
+            </motion.div>
+          </AnimatePresence>
+        )}
       </main>
+
+      {/* Data source indicator */}
+      {isLiveMode && (
+        <div className="fixed bottom-20 right-6 z-40">
+          <div className="bg-green-50 border border-green-200 px-2.5 py-1 text-[9px] font-mono text-green-700 uppercase tracking-wider flex items-center space-x-1.5 rounded-sm shadow-sm">
+            <span className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
+            <span>LIVE · SUPABASE</span>
+          </div>
+        </div>
+      )}
 
       {/* Humble, Literal Minimalist Human-friendly Page Footer */}
       <footer className="bg-white border-t border-neutral-200 py-6 select-none font-mono text-[10px] text-neutral-400 tracking-wider">

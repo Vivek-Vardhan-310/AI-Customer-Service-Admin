@@ -1,0 +1,401 @@
+import { supabase } from './supabaseClient';
+import type { Ticket, Customer, Product, Review, SlaRule, TicketStatus } from './types';
+
+// ── Auth ─────────────────────────────────────────────────────
+
+export async function adminLogin(email: string, password: string): Promise<{ success: boolean; error?: string }> {
+  if (!supabase) return { success: false, error: 'Supabase not configured' };
+
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  if (error) return { success: false, error: error.message };
+
+  if (!data?.session) return { success: false, error: 'No session received' };
+
+  // Verify admin role
+  const { data: profile, error: profileError } = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('id', data.user.id)
+    .single();
+
+  if (profileError || profile?.role !== 'admin') {
+    await supabase.auth.signOut();
+    return { success: false, error: 'Access denied. Admin privileges required.' };
+  }
+
+  return { success: true };
+}
+
+export async function adminLogout(): Promise<void> {
+  if (!supabase) return;
+  await supabase.auth.signOut();
+}
+
+export async function getAdminSession(): Promise<{ email: string; userId: string } | null> {
+  if (!supabase) return null;
+
+  const { data: { session } } = await supabase.auth.getSession();
+  if (!session) return null;
+
+  // Verify admin role
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('id', session.user.id)
+    .single();
+
+  if (profile?.role !== 'admin') return null;
+
+  return { email: session.user.email || '', userId: session.user.id };
+}
+
+// ── Tickets ──────────────────────────────────────────────────
+
+// Map DB status to admin panel status format
+function mapTicketStatus(dbStatus: string): TicketStatus {
+  const mapping: Record<string, TicketStatus> = {
+    'Open': 'OPEN',
+    'In Progress': 'PENDING',
+    'Resolved': 'RESOLVED',
+    'Closed': 'CLOSED',
+  };
+  return mapping[dbStatus] || 'OPEN';
+}
+
+// Map admin status back to DB format
+function mapStatusToDB(adminStatus: TicketStatus): string {
+  const mapping: Record<TicketStatus, string> = {
+    'OPEN': 'Open',
+    'PENDING': 'In Progress',
+    'RESOLVED': 'Resolved',
+    'CLOSED': 'Closed',
+    'ESCALATED': 'Open', // No escalated status in DB, keep as Open
+  };
+  return mapping[adminStatus] || 'Open';
+}
+
+function formatTimeAgo(dateStr: string): string {
+  const date = new Date(dateStr);
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMins / 60);
+  const diffDays = Math.floor(diffHours / 24);
+
+  if (diffMins < 1) return 'Just now';
+  if (diffMins < 60) return `${diffMins}m ago`;
+  if (diffHours < 24) return `${diffHours}h ago`;
+  if (diffDays < 30) return `${diffDays}d ago`;
+  return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+export async function fetchAllTickets(): Promise<Ticket[]> {
+  if (!supabase) return [];
+
+  const { data, error } = await supabase
+    .from('tickets')
+    .select(`
+      *,
+      profile:profiles!tickets_user_id_fkey(full_name, email),
+      product:products(name)
+    `)
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    console.error('fetchAllTickets error:', error);
+    return [];
+  }
+
+  return (data || []).map((t) => ({
+    id: t.id,
+    subject: t.title,
+    customer: t.profile?.full_name || t.profile?.email || 'Unknown',
+    status: mapTicketStatus(t.status),
+    priority: categorizeTicketPriority(t.category, t.status),
+    lastUpdated: formatTimeAgo(t.updated_at),
+    department: categorizeTicketDepartment(t.category),
+    date: new Date(t.created_at).toISOString().split('T')[0],
+  }));
+}
+
+function categorizeTicketPriority(category: string | null, status: string): 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' {
+  if (status === 'Open') return 'HIGH';
+  if (status === 'In Progress') return 'MEDIUM';
+  if (category?.toLowerCase().includes('battery') || category?.toLowerCase().includes('hardware')) return 'HIGH';
+  return 'LOW';
+}
+
+function categorizeTicketDepartment(category: string | null): string {
+  if (!category) return 'L1 Support';
+  const cat = category.toLowerCase();
+  if (cat.includes('billing') || cat.includes('warranty') || cat.includes('amc')) return 'Billing';
+  if (cat.includes('network') || cat.includes('software') || cat.includes('driver')) return 'L2 Technical';
+  return 'L1 Support';
+}
+
+export async function updateTicketStatus(id: string, status: TicketStatus): Promise<boolean> {
+  if (!supabase) return false;
+
+  const dbStatus = mapStatusToDB(status);
+  const { error } = await supabase
+    .from('tickets')
+    .update({ status: dbStatus })
+    .eq('id', id);
+
+  if (error) {
+    console.error('updateTicketStatus error:', error);
+    return false;
+  }
+
+  // Also update the timeline
+  if (dbStatus === 'Resolved' || dbStatus === 'Closed') {
+    const stepName = dbStatus;
+    await supabase
+      .from('ticket_timeline')
+      .update({ is_done: true, step_date: new Date().toISOString() })
+      .eq('ticket_id', id)
+      .eq('step_name', stepName);
+  }
+
+  return true;
+}
+
+// ── Customers ────────────────────────────────────────────────
+
+export async function fetchAllCustomers(): Promise<Customer[]> {
+  if (!supabase) return [];
+
+  const { data, error } = await supabase.rpc('get_admin_customers');
+
+  if (error) {
+    console.error('fetchAllCustomers error:', error);
+    return [];
+  }
+
+  return (data || []).map((c: any, index: number) => ({
+    id: `CID-${1001 + index}`,
+    name: c.full_name || 'Unknown User',
+    contactPerson: c.full_name || 'Unknown',
+    location: 'N/A',
+    productsOwned: Number(c.products_owned) || 0,
+    openTickets: Number(c.open_tickets) || 0,
+    plan: 'STANDARD' as const,
+    industry: 'Individual',
+    status: Number(c.open_tickets) > 2 ? 'AT RISK' as const : 'ACTIVE' as const,
+    email: c.email || '',
+  }));
+}
+
+// ── Products (Admin aggregate view) ──────────────────────────
+
+export async function fetchAllProducts(): Promise<Product[]> {
+  if (!supabase) return [];
+
+  const { data, error } = await supabase
+    .from('products')
+    .select('*')
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    console.error('fetchAllProducts error:', error);
+    return [];
+  }
+
+  // Aggregate by model/name to get admin-level product view
+  const productMap = new Map<string, {
+    name: string;
+    model: string | null;
+    count: number;
+    warrantyActive: number;
+    amcActive: number;
+  }>();
+
+  (data || []).forEach((p) => {
+    const key = p.name;
+    const existing = productMap.get(key);
+    const today = new Date();
+    const warrantyEnd = p.warranty_end ? new Date(p.warranty_end) : null;
+    const isWarrantyActive = warrantyEnd && warrantyEnd > today;
+    const isAmcActive = p.amc_status === 'Active';
+
+    if (existing) {
+      existing.count += 1;
+      if (isWarrantyActive) existing.warrantyActive += 1;
+      if (isAmcActive) existing.amcActive += 1;
+    } else {
+      productMap.set(key, {
+        name: p.name,
+        model: p.model,
+        count: 1,
+        warrantyActive: isWarrantyActive ? 1 : 0,
+        amcActive: isAmcActive ? 1 : 0,
+      });
+    }
+  });
+
+  const products: Product[] = [];
+  let idx = 0;
+  productMap.forEach((val) => {
+    products.push({
+      id: `PID-${2001 + idx}`,
+      name: val.name,
+      category: 'Electronics',
+      activeCustomers: val.count,
+      warrantyCoverage: val.count > 0 ? Math.round((val.warrantyActive / val.count) * 100) : 0,
+      amcCoverage: val.count > 0 ? Math.round((val.amcActive / val.count) * 100) : 0,
+      modelSeries: val.model || val.name,
+      releaseYear: new Date().getFullYear(),
+    });
+    idx++;
+  });
+
+  return products;
+}
+
+// ── Feedback / Reviews ───────────────────────────────────────
+
+export async function fetchAllFeedback(): Promise<Review[]> {
+  if (!supabase) return [];
+
+  const { data, error } = await supabase
+    .from('feedback')
+    .select(`
+      *,
+      profile:profiles!feedback_user_id_fkey(full_name, email),
+      ticket:tickets(id, title)
+    `)
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    console.error('fetchAllFeedback error:', error);
+    return [];
+  }
+
+  return (data || []).map((f: any) => ({
+    id: f.id,
+    customer: f.profile?.full_name || f.profile?.email || 'Anonymous',
+    ticketId: f.ticket_id || '',
+    rating: f.rating,
+    comment: f.comment || 'No comment provided.',
+    date: new Date(f.created_at).toISOString().split('T')[0],
+  }));
+}
+
+// ── SLA Rules ────────────────────────────────────────────────
+
+export async function fetchSlaRules(): Promise<SlaRule[]> {
+  if (!supabase) return [];
+
+  const { data, error } = await supabase
+    .from('sla_rules')
+    .select('*')
+    .order('created_at', { ascending: true });
+
+  if (error) {
+    console.error('fetchSlaRules error:', error);
+    return [];
+  }
+
+  return (data || []).map((r: any) => ({
+    id: r.id,
+    ruleName: r.rule_name,
+    department: r.department,
+    condition: r.condition,
+    priority: r.priority,
+    resolutionTime: r.resolution_time,
+    notification: r.notification,
+    status: r.status,
+  }));
+}
+
+export async function createSlaRule(rule: SlaRule): Promise<boolean> {
+  if (!supabase) return false;
+
+  const { error } = await supabase
+    .from('sla_rules')
+    .insert({
+      id: rule.id,
+      rule_name: rule.ruleName,
+      department: rule.department,
+      condition: rule.condition,
+      priority: rule.priority,
+      resolution_time: rule.resolutionTime,
+      notification: rule.notification,
+      status: rule.status,
+    });
+
+  if (error) {
+    console.error('createSlaRule error:', error);
+    return false;
+  }
+  return true;
+}
+
+export async function updateSlaRule(id: string, rule: SlaRule): Promise<boolean> {
+  if (!supabase) return false;
+
+  const { error } = await supabase
+    .from('sla_rules')
+    .update({
+      rule_name: rule.ruleName,
+      department: rule.department,
+      condition: rule.condition,
+      priority: rule.priority,
+      resolution_time: rule.resolutionTime,
+      notification: rule.notification,
+      status: rule.status,
+    })
+    .eq('id', id);
+
+  if (error) {
+    console.error('updateSlaRule error:', error);
+    return false;
+  }
+  return true;
+}
+
+export async function toggleSlaRuleStatus(id: string, currentStatus: string): Promise<boolean> {
+  if (!supabase) return false;
+
+  const newStatus = currentStatus === 'ENABLED' ? 'DISABLED' : 'ENABLED';
+  const { error } = await supabase
+    .from('sla_rules')
+    .update({ status: newStatus })
+    .eq('id', id);
+
+  if (error) {
+    console.error('toggleSlaRuleStatus error:', error);
+    return false;
+  }
+  return true;
+}
+
+export async function deleteSlaRule(id: string): Promise<boolean> {
+  if (!supabase) return false;
+
+  const { error } = await supabase
+    .from('sla_rules')
+    .delete()
+    .eq('id', id);
+
+  if (error) {
+    console.error('deleteSlaRule error:', error);
+    return false;
+  }
+  return true;
+}
+
+// ── Dashboard Stats ──────────────────────────────────────────
+
+export async function fetchDashboardStats(): Promise<Record<string, number> | null> {
+  if (!supabase) return null;
+
+  const { data, error } = await supabase.rpc('get_admin_dashboard_stats');
+
+  if (error) {
+    console.error('fetchDashboardStats error:', error);
+    return null;
+  }
+
+  return data;
+}

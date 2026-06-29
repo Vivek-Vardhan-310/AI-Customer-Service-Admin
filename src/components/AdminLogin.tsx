@@ -1,23 +1,21 @@
 import React, { useState } from 'react';
 import { motion } from 'motion/react';
 import { Eye, EyeOff, ShieldCheck, Lock, Mail, ArrowRight, Laptop, KeyRound, AlertTriangle } from 'lucide-react';
+import { adminLogin } from '../supabaseService';
+import { supabase } from '../supabaseClient';
 
 interface AdminLoginProps {
   onLoginSuccess: (email: string) => void;
 }
 
 export default function AdminLogin({ onLoginSuccess }: AdminLoginProps) {
-  const [email, setEmail] = useState('admin@lenovo.com');
-  const [password, setPassword] = useState('admin123');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
 
-  // Suggested Demo Credentials
-  const DEMO_EMAIL = 'admin@lenovo.com';
-  const DEMO_PASS = 'admin123';
-
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorBanner(null);
 
@@ -28,28 +26,39 @@ export default function AdminLogin({ onLoginSuccess }: AdminLoginProps) {
 
     setIsLoading(true);
 
-    // Simulate authenticating against the local encrypted ledger
-    setTimeout(() => {
-      if (email.toLowerCase() === DEMO_EMAIL && password === DEMO_PASS) {
+    // If Supabase is not configured, fall back to demo mode
+    if (!supabase) {
+      setTimeout(() => {
         onLoginSuccess(email);
-      } else if (email.toLowerCase() === 'agent.lenovo@lenovo.com' && password === 'admin123') {
-        onLoginSuccess('agent.lenovo@lenovo.com');
+      }, 800);
+      return;
+    }
+
+    try {
+      const result = await adminLogin(email, password);
+      if (result.success) {
+        onLoginSuccess(email);
       } else {
-        setErrorBanner('CREDENTIAL AUDIT FAILED: Incorrect administrative portal key or address.');
+        setErrorBanner(result.error || 'CREDENTIAL AUDIT FAILED: Incorrect administrative portal key or address.');
         setIsLoading(false);
       }
-    }, 1200);
+    } catch (err) {
+      setErrorBanner('CREDENTIAL AUDIT FAILED: An unexpected error occurred.');
+      setIsLoading(false);
+    }
   };
 
   const handleAutoFillAndLogin = () => {
-    setEmail(DEMO_EMAIL);
-    setPassword(DEMO_PASS);
     setErrorBanner(null);
-    setIsLoading(true);
-
-    setTimeout(() => {
-      onLoginSuccess(DEMO_EMAIL);
-    }, 1000);
+    // When Supabase is not configured, allow demo login
+    if (!supabase) {
+      setEmail('admin@lenovo.com');
+      setPassword('admin123');
+      setIsLoading(true);
+      setTimeout(() => {
+        onLoginSuccess('admin@lenovo.com');
+      }, 800);
+    }
   };
 
   return (
