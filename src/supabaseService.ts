@@ -97,7 +97,7 @@ export async function fetchAllTickets(): Promise<Ticket[]> {
     .select(`
       *,
       profile:profiles!tickets_user_id_fkey(full_name, email),
-      product:products(name)
+      user_product:user_products(product:product_catalog(name))
     `)
     .order('created_at', { ascending: false });
 
@@ -191,9 +191,10 @@ export async function fetchAllCustomers(): Promise<Customer[]> {
 export async function fetchAllProducts(): Promise<Product[]> {
   if (!supabase) return [];
 
+  // Fetch catalog products with their user_products instances for aggregation
   const { data, error } = await supabase
-    .from('products')
-    .select('*')
+    .from('product_catalog')
+    .select('*, instances:user_products(id, warranty_end, amc_status)')
     .order('created_at', { ascending: false });
 
   if (error) {
@@ -201,55 +202,28 @@ export async function fetchAllProducts(): Promise<Product[]> {
     return [];
   }
 
-  // Aggregate by model/name to get admin-level product view
-  const productMap = new Map<string, {
-    name: string;
-    model: string | null;
-    count: number;
-    warrantyActive: number;
-    amcActive: number;
-  }>();
+  const today = new Date();
 
-  (data || []).forEach((p) => {
-    const key = p.name;
-    const existing = productMap.get(key);
-    const today = new Date();
-    const warrantyEnd = p.warranty_end ? new Date(p.warranty_end) : null;
-    const isWarrantyActive = warrantyEnd && warrantyEnd > today;
-    const isAmcActive = p.amc_status === 'Active';
+  return (data || []).map((p, idx) => {
+    const instances = p.instances || [];
+    const count = instances.length;
+    const warrantyActive = instances.filter((i: any) => {
+      const end = i.warranty_end ? new Date(i.warranty_end) : null;
+      return end && end > today;
+    }).length;
+    const amcActive = instances.filter((i: any) => i.amc_status === 'Active').length;
 
-    if (existing) {
-      existing.count += 1;
-      if (isWarrantyActive) existing.warrantyActive += 1;
-      if (isAmcActive) existing.amcActive += 1;
-    } else {
-      productMap.set(key, {
-        name: p.name,
-        model: p.model,
-        count: 1,
-        warrantyActive: isWarrantyActive ? 1 : 0,
-        amcActive: isAmcActive ? 1 : 0,
-      });
-    }
+    return {
+      id: p.id,
+      name: p.name,
+      category: 'Electronics' as const,
+      activeCustomers: count,
+      warrantyCoverage: count > 0 ? Math.round((warrantyActive / count) * 100) : 0,
+      amcCoverage: count > 0 ? Math.round((amcActive / count) * 100) : 0,
+      modelSeries: p.model || p.name,
+      releaseYear: new Date(p.created_at).getFullYear(),
+    };
   });
-
-  const products: Product[] = [];
-  let idx = 0;
-  productMap.forEach((val) => {
-    products.push({
-      id: `PID-${2001 + idx}`,
-      name: val.name,
-      category: 'Electronics',
-      activeCustomers: val.count,
-      warrantyCoverage: val.count > 0 ? Math.round((val.warrantyActive / val.count) * 100) : 0,
-      amcCoverage: val.count > 0 ? Math.round((val.amcActive / val.count) * 100) : 0,
-      modelSeries: val.model || val.name,
-      releaseYear: new Date().getFullYear(),
-    });
-    idx++;
-  });
-
-  return products;
 }
 
 // ── Feedback / Reviews ───────────────────────────────────────
