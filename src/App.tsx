@@ -96,9 +96,15 @@ export default function App() {
         if (session) {
           setAdminEmail(session.email);
           localStorage.setItem('lenovo_admin_email', session.email);
+        } else {
+          // If no active session or role is not admin, clear the email
+          setAdminEmail('');
+          localStorage.removeItem('lenovo_admin_email');
         }
       } catch (e) {
         console.error('Session check error:', e);
+        setAdminEmail('');
+        localStorage.removeItem('lenovo_admin_email');
       } finally {
         setSessionChecked(true);
       }
@@ -313,6 +319,8 @@ export default function App() {
         return (
           <Customers
             customers={customers}
+            products={products}
+            onRefreshData={loadAllData}
             setActiveTab={setActiveTab}
             setSearchTermInTickets={setTicketsSearchTerm}
           />

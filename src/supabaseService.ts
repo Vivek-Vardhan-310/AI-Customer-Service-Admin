@@ -1,5 +1,5 @@
 import { supabase } from './supabaseClient';
-import type { Ticket, Customer, Product, Review, SlaRule, TicketStatus } from './types';
+import type { Ticket, Customer, Product, Review, SlaRule, TicketStatus, CustomerStatus } from './types';
 
 // ── Auth ─────────────────────────────────────────────────────
 
@@ -92,30 +92,45 @@ function formatTimeAgo(dateStr: string): string {
 export async function fetchAllTickets(): Promise<Ticket[]> {
   if (!supabase) return [];
 
-  const { data, error } = await supabase
+  // Fetch tickets (no FK join to profiles — FK goes to auth.users, not profiles)
+  const { data: ticketsData, error: ticketsError } = await supabase
     .from('tickets')
-    .select(`
-      *,
-      profile:profiles!tickets_user_id_fkey(full_name, email),
-      user_product:user_products(product:product_catalog(name))
-    `)
+    .select('*')
     .order('created_at', { ascending: false });
 
-  if (error) {
-    console.error('fetchAllTickets error:', error);
+  if (ticketsError) {
+    console.error('fetchAllTickets error:', ticketsError);
     return [];
   }
 
-  return (data || []).map((t) => ({
-    id: t.id,
-    subject: t.title,
-    customer: t.profile?.full_name || t.profile?.email || 'Unknown',
-    status: mapTicketStatus(t.status),
-    priority: categorizeTicketPriority(t.category, t.status),
-    lastUpdated: formatTimeAgo(t.updated_at),
-    department: categorizeTicketDepartment(t.category),
-    date: new Date(t.created_at).toISOString().split('T')[0],
-  }));
+  // Fetch all user profiles to map user_id → name/email
+  const userIds = [...new Set((ticketsData || []).map((t: any) => t.user_id).filter(Boolean))];
+  let profilesMap: Record<string, { full_name: string; email: string }> = {};
+
+  if (userIds.length > 0) {
+    const { data: profiles } = await supabase
+      .from('profiles')
+      .select('id, full_name, email')
+      .in('id', userIds);
+
+    (profiles || []).forEach((p: any) => {
+      profilesMap[p.id] = { full_name: p.full_name || '', email: p.email || '' };
+    });
+  }
+
+  return (ticketsData || []).map((t: any) => {
+    const profile = profilesMap[t.user_id];
+    return {
+      id: t.id,
+      subject: t.title,
+      customer: profile?.full_name || profile?.email || 'Unknown',
+      status: mapTicketStatus(t.status),
+      priority: categorizeTicketPriority(t.category, t.status),
+      lastUpdated: formatTimeAgo(t.updated_at),
+      department: categorizeTicketDepartment(t.category),
+      date: new Date(t.created_at).toISOString().split('T')[0],
+    };
+  });
 }
 
 function categorizeTicketPriority(category: string | null, status: string): 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' {
@@ -165,28 +180,112 @@ export async function updateTicketStatus(id: string, status: TicketStatus): Prom
 export async function fetchAllCustomers(): Promise<Customer[]> {
   if (!supabase) return [];
 
-  const { data, error } = await supabase.rpc('get_admin_customers');
+  // Fetch all user profiles with aggregated product and ticket counts
+  const { data: allProfiles, error: profilesError } = await supabase
+    .from('profiles')
+    .select('*')
+    .order('created_at', { ascending: false });
 
-  if (error) {
-    console.error('fetchAllCustomers error:', error);
+  if (profilesError) {
+    console.error('fetchAllCustomers error:', profilesError);
     return [];
   }
 
-  return (data || []).map((c: any, index: number) => ({
-    id: `CID-${1001 + index}`,
-    name: c.full_name || 'Unknown User',
-    contactPerson: c.full_name || 'Unknown',
-    location: 'N/A',
-    productsOwned: Number(c.products_owned) || 0,
-    openTickets: Number(c.open_tickets) || 0,
-    plan: 'STANDARD' as const,
-    industry: 'Individual',
-    status: Number(c.open_tickets) > 2 ? 'AT RISK' as const : 'ACTIVE' as const,
-    email: c.email || '',
-  }));
+  // Filter out admin users in JS to handle NULL or alternative roles gracefully
+  const profiles = (allProfiles || []).filter((p: any) => p.role !== 'admin');
+
+  // For each profile, get product and ticket counts
+  const customers: Customer[] = await Promise.all(
+    (profiles || []).map(async (p: any) => {
+      // Get product count
+      const { count: productsCount } = await supabase!
+        .from('user_products')
+        .select('id', { count: 'exact', head: true })
+        .eq('user_id', p.id);
+
+      // Get open ticket count
+      const { count: openTicketsCount } = await supabase!
+        .from('tickets')
+        .select('id', { count: 'exact', head: true })
+        .eq('user_id', p.id)
+        .in('status', ['Open', 'In Progress']);
+
+      // Get total ticket count
+      const { count: totalTicketsCount } = await supabase!
+        .from('tickets')
+        .select('id', { count: 'exact', head: true })
+        .eq('user_id', p.id);
+
+      const openTix = openTicketsCount || 0;
+      const status: CustomerStatus = openTix > 0 ? 'ACTIVE' : (totalTicketsCount || 0) > 0 ? 'ACTIVE' : 'INACTIVE';
+
+      return {
+        id: p.id,
+        name: p.full_name || p.email?.split('@')[0] || 'Unknown User',
+        email: p.email || '',
+        phone: p.phone || '',
+        productsOwned: productsCount || 0,
+        openTickets: openTix,
+        totalTickets: totalTicketsCount || 0,
+        status,
+        createdAt: p.created_at,
+      };
+    })
+  );
+
+  return customers;
 }
 
-// ── Products (Admin aggregate view) ──────────────────────────
+export async function addProductToCustomer(
+  userId: string,
+  productId: string,
+  serialNumber: string,
+  purchaseDate: string
+): Promise<boolean> {
+  if (!supabase) return true; // Mock success in offline mode
+
+  try {
+    // 1. Fetch base warranty days from product_catalog
+    const { data: catItem, error: catError } = await supabase
+      .from('product_catalog')
+      .select('base_warranty_days')
+      .eq('id', productId)
+      .single();
+
+    const baseWarrantyDays = catItem?.base_warranty_days || 365;
+
+    // 2. Calculate warranty end date
+    const purchase = new Date(purchaseDate);
+    const warrantyEnd = new Date(purchase.getTime() + baseWarrantyDays * 24 * 60 * 60 * 1000);
+    const warrantyEndStr = warrantyEnd.toISOString().split('T')[0];
+
+    // 3. Insert into user_products
+    const { error: insertError } = await supabase
+      .from('user_products')
+      .insert({
+        user_id: userId,
+        product_id: productId,
+        serial_number: serialNumber,
+        purchase_date: purchaseDate,
+        warranty_end: warrantyEndStr,
+        warranty_total_days: baseWarrantyDays,
+        amc_status: 'Inactive',
+        amc_total_days: 365,
+      });
+
+    if (insertError) {
+      console.error('Error inserting user product:', insertError);
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    console.error('addProductToCustomer catch error:', err);
+    return false;
+  }
+}
+
+// ── Products (individual product instances from DB) ──────────
 
 export async function fetchAllProducts(): Promise<Product[]> {
   if (!supabase) return [];
@@ -204,7 +303,7 @@ export async function fetchAllProducts(): Promise<Product[]> {
 
   const today = new Date();
 
-  return (data || []).map((p, idx) => {
+  return (data || []).map((p: any) => {
     const instances = p.instances || [];
     const count = instances.length;
     const warrantyActive = instances.filter((i: any) => {
@@ -216,12 +315,14 @@ export async function fetchAllProducts(): Promise<Product[]> {
     return {
       id: p.id,
       name: p.name,
-      category: 'Electronics' as const,
+      model: p.model || '',
+      description: p.description || null,
+      imageUrl: p.image_url || null,
+      baseWarrantyDays: p.base_warranty_days || 365,
       activeCustomers: count,
       warrantyCoverage: count > 0 ? Math.round((warrantyActive / count) * 100) : 0,
       amcCoverage: count > 0 ? Math.round((amcActive / count) * 100) : 0,
-      modelSeries: p.model || p.name,
-      releaseYear: new Date(p.created_at).getFullYear(),
+      createdAt: p.created_at,
     };
   });
 }
@@ -231,28 +332,43 @@ export async function fetchAllProducts(): Promise<Product[]> {
 export async function fetchAllFeedback(): Promise<Review[]> {
   if (!supabase) return [];
 
-  const { data, error } = await supabase
+  // Fetch feedback (no FK join to profiles — FK goes to auth.users)
+  const { data: feedbackData, error: feedbackError } = await supabase
     .from('feedback')
-    .select(`
-      *,
-      profile:profiles!feedback_user_id_fkey(full_name, email),
-      ticket:tickets(id, title)
-    `)
+    .select('*')
     .order('created_at', { ascending: false });
 
-  if (error) {
-    console.error('fetchAllFeedback error:', error);
+  if (feedbackError) {
+    console.error('fetchAllFeedback error:', feedbackError);
     return [];
   }
 
-  return (data || []).map((f: any) => ({
-    id: f.id,
-    customer: f.profile?.full_name || f.profile?.email || 'Anonymous',
-    ticketId: f.ticket_id || '',
-    rating: f.rating,
-    comment: f.comment || 'No comment provided.',
-    date: new Date(f.created_at).toISOString().split('T')[0],
-  }));
+  // Fetch profiles for feedback authors
+  const userIds = [...new Set((feedbackData || []).map((f: any) => f.user_id).filter(Boolean))];
+  let profilesMap: Record<string, { full_name: string; email: string }> = {};
+
+  if (userIds.length > 0) {
+    const { data: profiles } = await supabase
+      .from('profiles')
+      .select('id, full_name, email')
+      .in('id', userIds);
+
+    (profiles || []).forEach((p: any) => {
+      profilesMap[p.id] = { full_name: p.full_name || '', email: p.email || '' };
+    });
+  }
+
+  return (feedbackData || []).map((f: any) => {
+    const profile = profilesMap[f.user_id];
+    return {
+      id: f.id,
+      customer: profile?.full_name || profile?.email || 'Anonymous',
+      ticketId: f.ticket_id || '',
+      rating: f.rating,
+      comment: f.comment || 'No comment provided.',
+      date: new Date(f.created_at).toISOString().split('T')[0],
+    };
+  });
 }
 
 // ── SLA Rules ────────────────────────────────────────────────

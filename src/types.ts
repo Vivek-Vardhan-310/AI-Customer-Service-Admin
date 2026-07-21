@@ -12,33 +12,31 @@ export interface Ticket {
   date: string; // YYYY-MM-DD
 }
 
-export type CustomerPlan = 'PREMIUM' | 'STANDARD' | 'FREE';
-export type CustomerStatus = 'ACTIVE' | 'AT RISK' | 'INACTIVE';
+export type CustomerStatus = 'ACTIVE' | 'INACTIVE';
 
 export interface Customer {
   id: string;
   name: string;
-  contactPerson: string;
-  location: string;
-  productsOwned: number;
-  openTickets: number; // Support History
-  plan: CustomerPlan;
-  industry: string;
-  status: CustomerStatus;
   email: string;
+  phone: string;
+  productsOwned: number;
+  openTickets: number;
+  totalTickets: number;
+  status: CustomerStatus;
+  createdAt: string;
 }
-
-export type ProductCategory = 'Appliance' | 'Electronics' | 'Software' | 'Services';
 
 export interface Product {
   id: string;
   name: string;
-  category: ProductCategory;
+  model: string;
+  description: string | null;
+  imageUrl: string | null;
+  baseWarrantyDays: number;
   activeCustomers: number;
-  warrantyCoverage: number; // e.g., 85
-  amcCoverage: number; // e.g., 60
-  modelSeries: string;
-  releaseYear: number;
+  warrantyCoverage: number;
+  amcCoverage: number;
+  createdAt: string;
 }
 
 export interface Review {
